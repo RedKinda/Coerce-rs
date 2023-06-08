@@ -4,6 +4,7 @@ use crate::remote::net::server::session::RemoteSession;
 use crate::remote::system::RemoteActorSystem;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::sync::CancellationToken;
 
 pub mod session;
@@ -23,7 +24,7 @@ pub type RemoteServerConfigRef = Arc<RemoteServerConfig>;
 #[derive(Debug)]
 pub struct RemoteServerConfig {
     /// The address to listen for Coerce cluster client connections
-    pub listen_addr: String,
+    pub listen_addr: ListenerAddress,
 
     /// The address advertised by this node via the handshake
     pub external_node_addr: String,
@@ -48,6 +49,67 @@ impl RemoteServerConfig {
     }
 }
 
+pub enum ListenerAddress {
+    Tcp(SocketAddr),
+    Unix(String),
+}
+
+#[derive(Debug)]
+enum Listener {
+    Tcp(tokio::net::TcpListener),
+    Unix(tokio::net::UnixListener),
+}
+impl Listener {
+    async fn accept(&self) -> tokio::io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        match self {
+            Listener::Tcp(listener) => listener.accept().await,
+            Listener::Unix(listener) => {
+                let (stream, addr) = listener.accept().await?;
+                let addr = SocketAddr::new(addr, 0);
+                Ok((stream, addr))
+            }
+        }
+    }
+}
+
+pub enum ListenerStream {
+    Tcp(tokio::net::TcpStream),
+    Unix(tokio::net::UnixStream),
+}
+impl AsyncRead for ListenerStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            ListenerStream::Tcp(tcps) => std::pin::Pin::new(tcps).poll_read(cx, buf),
+            ListenerStream::Unix(unixs) => std::pin::Pin::new(unixs).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for ListenerStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<Result<usize, std::io::Error>> {
+        match self.get_mut() {
+            ListenerStream::Tcp(tcps) => std::pin::Pin::new(tcps).poll_write(cx, buf),
+            ListenerStream::Unix(unixs) => std::pin::Pin::new(unixs).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+        
+    }
+
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), std::io::Error>> {
+        todo!()
+    }
+}
+
 impl RemoteServer {
     pub fn new() -> Self {
         RemoteServer {
@@ -66,7 +128,10 @@ impl RemoteServer {
             &config
         );
 
-        let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
+        let listener = match &config.listen_addr {
+            ListenerAddress::Tcp(addr) => Listener::Tcp(tokio::net::TcpListener::bind(addr).await?),
+            ListenerAddress::Unix(path) => Listener::Unix(tokio::net::UnixListener::bind(path)?),
+        };
 
         let session_store = RemoteSessionStore::new()
             .into_actor(Some("remote-session-store"), &system.actor_system())
@@ -94,7 +159,7 @@ pub async fn cancellation(cancellation_token: CancellationToken) {
 }
 
 pub async fn accept(
-    listener: &tokio::net::TcpListener,
+    listener: &Listener,
     cancellation_token: CancellationToken,
 ) -> Option<tokio::io::Result<(tokio::net::TcpStream, SocketAddr)>> {
     tokio::select! {
@@ -109,7 +174,7 @@ pub async fn accept(
 }
 
 pub async fn server_loop(
-    listener: tokio::net::TcpListener,
+    listener: Listener,
     session_store: LocalActorRef<RemoteSessionStore>,
     cancellation_token: CancellationToken,
     remote_server_config: RemoteServerConfigRef,

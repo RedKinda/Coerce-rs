@@ -28,7 +28,7 @@ use std::io::Error;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
-use tokio::io::{ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -36,13 +36,15 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use valuable::Valuable;
 
+use super::ListenerStream;
+
 pub mod store;
 
 pub struct RemoteSession {
     id: i64,
     addr: SocketAddr,
-    write: FramedWrite<WriteHalf<TcpStream>, LengthDelimitedCodec>,
-    read: Option<FramedRead<ReadHalf<TcpStream>, LengthDelimitedCodec>>,
+    write: FramedWrite<WriteHalf<ListenerStream>, LengthDelimitedCodec>,
+    read: Option<FramedRead<ReadHalf<ListenerStream>, LengthDelimitedCodec>>,
     read_cancellation_token: Option<CancellationToken>,
     remote_server_config: RemoteServerConfigRef,
 }
@@ -51,20 +53,38 @@ impl RemoteSession {
     pub fn new(
         id: i64,
         addr: SocketAddr,
-        stream: TcpStream,
+        stream: ListenerStream,
         remote_server_config: RemoteServerConfigRef,
     ) -> RemoteSession {
-        let (read, write) = tokio::io::split(stream);
-        let read = Some(FramedRead::new(read, LengthDelimitedCodec::new()));
-        let write = FramedWrite::new(write, LengthDelimitedCodec::new());
-        RemoteSession {
-            id,
-            addr,
-            write,
-            read,
-            read_cancellation_token: Some(CancellationToken::new()),
-            remote_server_config,
-        }
+        let session = match stream {
+            ListenerStream::Tcp(tcps) => {
+                let (read, write) = tokio::io::split(tcps);
+                let read = Some(FramedRead::new(read, LengthDelimitedCodec::new()));
+                let write = FramedWrite::new(write, LengthDelimitedCodec::new());
+                RemoteSession {
+                    id,
+                    addr,
+                    write,
+                    read,
+                    read_cancellation_token: Some(CancellationToken::new()),
+                    remote_server_config,
+                }
+            }
+            ListenerStream::Unix(unixs) => {
+                let (read, write) = tokio::io::split(unixs);
+                let read = Some(FramedRead::new(read, LengthDelimitedCodec::new()));
+                let write = FramedWrite::new(write, LengthDelimitedCodec::new());
+                RemoteSession {
+                    id,
+                    addr,
+                    write,
+                    read,
+                    read_cancellation_token: Some(CancellationToken::new()),
+                    remote_server_config,
+                }
+            }
+        };
+        session
     }
 }
 
